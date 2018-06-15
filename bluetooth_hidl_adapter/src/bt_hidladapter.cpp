@@ -6,6 +6,7 @@
 #include <sys/stat.h>
 #include <utils/Log.h>
 #include <stdlib.h>
+#include <map>
 
 #include <android/hardware/bluetooth/1.0/IBluetoothHci.h>
 #include <android/hardware/bluetooth/1.0/IBluetoothHciCallbacks.h>
@@ -20,9 +21,14 @@ using android::hardware::ProcessState;
 using ::android::hardware::Return;
 using ::android::hardware::Void;
 using ::android::hardware::hidl_vec;
+using std::map;
 
-// handle(2Byte) + ACL length(2Byte) = 4 Byte
+// |<---HCI_ACL_PREAMBLE_SIZE--->|<----L2CAP_HEADER_SIZE------>|
+// -----------------------------------------------------------------------
+// |handle(2Bytes)|ACLlen(2Bytes)|L2CAPlen(2Bytes)|CID(2Bytes) |L2CAP data
+// -----------------------------------------------------------------------
 #define HCI_ACL_PREAMBLE_SIZE 4
+#define L2CAP_HEADER_SIZE 4
 
 #define MSG_EVT_MASK 0xFF00
 
@@ -40,17 +46,94 @@ using ::android::hardware::hidl_vec;
     (p) += 2;                                                     \
 }                                                                 \
 
+#define STREAM_SKIP_UINT16(p) \
+    do {                      \
+	(p) += 2;             \
+    }  while (0)              \
+
+#define UINT16_TO_STREAM(p, u16)       \
+{                                      \
+    *(p)++ = (uint8_t)(u16);           \
+    *(p)++ = (uint8_t)((u16) >> 8);    \
+}                                      \
+
+#define GET_BOUNDARY_FLAG(handle)  (((handle) >> 12) & 0x0003)
+#define HANDLE_MASK 0x0FFF
+#define START_PACKET_BOUNDARY 2
+#define CONTINUATION_PACKET_BOUNDARY 1
 
 android::sp<IBluetoothHci> btHci;
 bt_hidl_cb_t* hidlCb;
+map<uint16_t, char*> partial_packets;
 
+//There may be memory leak in This function , check it carefully
 void reassemble_and_dispatch(BT_HDR* packet) {
+
     uint8_t* stream = packet->data;
     uint16_t handle, acl_length, l2cap_length;
     STREAM_TO_UINT16(handle, stream);
     STREAM_TO_UINT16(acl_length, stream);
     STREAM_TO_UINT16(l2cap_length, stream);
-    if (acl_length != packet->len - HCI_ACL_PREAMBLE_SIZE)
+
+    if (acl_length != packet->len - HCI_ACL_PREAMBLE_SIZE) {
+	ALOGE("bad acl length, drop this packet");
+	free(packet);
+    }
+    uint8_t boundary_flag = GET_BOUNDARY_FLAG(handle);
+    handle = handle & HANDLE_MASK;
+    if (boundary_flag == START_PACKET_BOUNDARY) {
+	map<uint16_t, char*>::iterator itr = partial_packets.find(handle);
+	if (itr != partial_packets.end()) {
+	    ALOGW("found unfinished packet for handle with start packet, drop it");
+	    char* old_stream = itr->second;
+	    partial_packets.erase(itr);
+	    free(old_stream);
+	}
+
+        if (acl_length < L2CAP_HEADER_SIZE) {
+	    ALOGW("L2CAP packet too small, drop it");
+	    free(packet);
+	    return;
+	}
+
+	//Note that the l2cap_length refers to the reassembled l2cap packet length
+	uint16_t full_length = l2cap_length + L2CAP_HEADER_SIZE + HCI_ACL_PREAMBLE_SIZE;
+
+	//No need reassembling
+	if (full_length <= packet->len) {
+	    if (full_length < packet->len) {
+		ALOGW("L2CAP full length %d less than the hci length %d, but we still keep it",
+			l2cap_length, packet->len);
+	    }
+
+	    //Send to upper layer
+	    hidlCb->acl_event_received(packet);
+	}
+
+	//Do need reassembling
+	//so we need reallocate memory for both start and continue L2CAP packet and free old memory 
+	BT_HDR* partial_packet = (BT_HDR*)malloc(full_length + BT_HDR_SZ);
+	partial_packet->event = ((BT_HDR*)packet)->event;
+	partial_packet->len = full_length;
+	partial_packet->offset = packet->len;
+        memcpy(partial_packet->data, packet->data, packet->len);
+
+	//Update the ACL data size to indicate the full expected length
+	stream = partial_packet->data;
+	STREAM_SKIP_UINT16(stream); //Skip the handle
+	UINT16_TO_STREAM(stream, full_length - HCI_ACL_PREAMBLE_SIZE);
+	
+	//Store in map until continue packet comes
+	partial_packets[handle] = (char*)partial_packet;
+
+        //Free old packet buffer.
+	free(packet);
+    } else if (boundary_flag == CONTINUATION_PACKET_BOUNDARY){
+	
+    } else {
+	ALOGE("bad flag, drop this packet");
+	free(packet);
+    }
 }
 
 class BluetoothHciCallbacks : public IBluetoothHciCallbacks {
@@ -60,7 +143,16 @@ class BluetoothHciCallbacks : public IBluetoothHciCallbacks {
 
 	BT_HDR* WrapPacketAndCopy(uint16_t event, const hidl_vec<uint8_t>& data) {
 	    int packet_size = data.size() + BT_HDR_SZ;
-	    char* p_buff = hidlCb->alloc(packet_size);
+	    char* p_buff = NULL;
+	    if (event == MSG_HC_TO_STACK_HCI_ACL) {
+
+		// For ACL packet, you may need to reassemble data packet, so, we use malloc()
+		// to allocate memory for it, after reassembling, you can free() it manually
+		// and then invoke hidlCb->alloc().
+		p_buff = (char*)malloc(packet_size);
+	    } else {
+		p_buff = hidlCb->alloc(packet_size);
+	    }
 	    if (p_buff == NULL) {
 		ALOGE("alloc memory failed");
 		return nullptr;
@@ -99,7 +191,8 @@ class BluetoothHciCallbacks : public IBluetoothHciCallbacks {
 	    ALOGI("aclDataReceived");
 	    BT_HDR* packet = WrapPacketAndCopy(MSG_HC_TO_STACK_HCI_ACL, data);
 	    if(packet != nullptr) {
-	        hidlCb->acl_event_received(packet);
+		reassemble_and_dispatch(packet);
+	        //hidlCb->acl_event_received(packet);
 	    }
 	    return Void();
 	}
@@ -112,6 +205,7 @@ class BluetoothHciCallbacks : public IBluetoothHciCallbacks {
 	    }
 	    return Void();
 	}
+	
 };
 
 void hci_initialize(const bt_hidl_cb_t* cb) {
@@ -164,4 +258,3 @@ void hci_transmit(BT_HDR* packet) {
 	    break;
     }
 }
-
