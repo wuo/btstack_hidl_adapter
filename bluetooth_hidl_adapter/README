@@ -1,0 +1,22 @@
+This project is used when:
+
+1.you want to use you own bluetooth stack but not bluedroid in Android;
+
+2.Android version beyond O, with which your stack should communicate with
+
+android.hardware.bluetooth@1.0-service through Binder.
+
+How to use this project:
+
+1.copy this project to the root path of Android tree;
+
+2.in Android root path:
+    
+    source build/envsetup.sh,
+    lunch XXX
+    cd bluetooth_hidl_adapter
+    mm  
+
+3.then you can find the lib in /out dir.
+
+  
