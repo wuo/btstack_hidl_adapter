@@ -5,7 +5,6 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <utils/Log.h>
-#include <stdlib.h>
 #include <map>
 
 #include <android/hardware/bluetooth/1.0/IBluetoothHci.h>
@@ -79,6 +78,7 @@ void reassemble_and_dispatch(BT_HDR* packet) {
     if (acl_length != packet->len - HCI_ACL_PREAMBLE_SIZE) {
 	ALOGE("bad acl length, drop this packet");
 	hidlCb->dealloc(packet, NULL);
+	return;
     }
 
     uint8_t boundary_flag = GET_BOUNDARY_FLAG(handle);
@@ -101,22 +101,23 @@ void reassemble_and_dispatch(BT_HDR* packet) {
 
 	//Note that the l2cap_length refers to the reassembled l2cap packet length
 	uint16_t full_length = l2cap_length + L2CAP_HEADER_SIZE + HCI_ACL_PREAMBLE_SIZE;
+	ALOGW("full_length: %d, packet->len: %d", full_length, packet->len);
 
-	//No need reassembling
+	//Do not need reassembling
 	if (full_length <= packet->len) {
 	    if (full_length < packet->len) {
 		ALOGW("full length %d less than the hci length %d, but we still keep it",
 			l2cap_length, packet->len);
 	    }
 
-	    //This packet is not followed with continuation packet
+	    //This packet is not followed with continuation packet, do not need reassembling.
 	    //Send to upper layer
 	    hidlCb->acl_data_received(packet);
+	    return;
 	}
 
 	//Do need reassembling
-	//We need to reallocate memory which is enough for both start packet and the
-	//coming continuation packet
+	//We need to reallocate memory for both start packet and the coming continuation packet
 	BT_HDR* partial_packet = (BT_HDR*)hidlCb->alloc(full_length + BT_HDR_SZ);
 	partial_packet->event = packet->event;
 	partial_packet->len = full_length;
@@ -140,8 +141,11 @@ void reassemble_and_dispatch(BT_HDR* packet) {
 	    hidlCb->dealloc(packet, NULL);
 	    return;
 	}
+
+	//Start packet found
         BT_HDR* partial_packet = (BT_HDR*)itr->second;
 
+	//Reassemble packet
 	packet->offset = HCI_ACL_PREAMBLE_SIZE;
 	uint16_t projected_offset = partial_packet->offset + (packet->len - HCI_ACL_PREAMBLE_SIZE);
 	if (projected_offset > partial_packet->len) {
