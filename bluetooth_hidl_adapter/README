@@ -3,8 +3,8 @@ This project is used when:
 1.you want to use you own bluetooth stack but not bluedroid in Android;
 
 2.Android version beyond O, with which your stack should communicate with
-
 android.hardware.bluetooth@1.0-service through Binder.
+
 
 How to use this project:
 
@@ -19,4 +19,12 @@ How to use this project:
 
 3.then you can find the lib in /out dir.
 
-  
+
+In your bluetooth stack, you need to implement struct bt_hidl_cb_t(which is
+defined in bt_hidladapter.h). When enable BT, use the struct to call function
+hci_initialize(). Call back functions in struct bt_hidl_cb_t would be called
+in proper scenario. When stack want to send data to HCI, just encapsulate data
+with a BT_HDR, and call function hci_transmit(). When you disable BT, just call
+hci_close().
+
+
