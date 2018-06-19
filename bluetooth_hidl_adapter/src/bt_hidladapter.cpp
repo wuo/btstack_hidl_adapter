@@ -71,28 +71,31 @@ void reassemble_and_dispatch(BT_HDR* packet) {
 
     uint8_t* stream = packet->data;
     uint16_t handle, acl_length, l2cap_length;
+
     STREAM_TO_UINT16(handle, stream);
     STREAM_TO_UINT16(acl_length, stream);
     STREAM_TO_UINT16(l2cap_length, stream);
 
     if (acl_length != packet->len - HCI_ACL_PREAMBLE_SIZE) {
 	ALOGE("bad acl length, drop this packet");
-	free(packet);
+	hidlCb->dealloc(packet, NULL);
     }
+
     uint8_t boundary_flag = GET_BOUNDARY_FLAG(handle);
     handle = handle & HANDLE_MASK;
+
     if (boundary_flag == START_PACKET_BOUNDARY) {
 	map<uint16_t, char*>::iterator itr = partial_packets.find(handle);
 	if (itr != partial_packets.end()) {
-	    ALOGW("found unfinished packet for handle with start packet, drop it");
+	    ALOGW("found unfinished packet for handle with start packet, dropping old");
 	    char* old_stream = itr->second;
+	    hidlCb->dealloc(old_stream, NULL);
 	    partial_packets.erase(itr);
-	    free(old_stream);
 	}
 
         if (acl_length < L2CAP_HEADER_SIZE) {
-	    ALOGW("L2CAP packet too small, drop it");
-	    free(packet);
+	    ALOGW("L2CAP packet too small, dropping it");
+	    hidlCb->dealloc(packet, NULL);
 	    return;
 	}
 
@@ -102,18 +105,20 @@ void reassemble_and_dispatch(BT_HDR* packet) {
 	//No need reassembling
 	if (full_length <= packet->len) {
 	    if (full_length < packet->len) {
-		ALOGW("L2CAP full length %d less than the hci length %d, but we still keep it",
+		ALOGW("full length %d less than the hci length %d, but we still keep it",
 			l2cap_length, packet->len);
 	    }
 
+	    //This packet is not followed with continuation packet
 	    //Send to upper layer
-	    hidlCb->acl_event_received(packet);
+	    hidlCb->acl_data_received(packet);
 	}
 
 	//Do need reassembling
-	//so we need reallocate memory for both start and continue L2CAP packet and free old memory 
-	BT_HDR* partial_packet = (BT_HDR*)malloc(full_length + BT_HDR_SZ);
-	partial_packet->event = ((BT_HDR*)packet)->event;
+	//We need to reallocate memory which is enough for both start packet and the
+	//coming continuation packet
+	BT_HDR* partial_packet = (BT_HDR*)hidlCb->alloc(full_length + BT_HDR_SZ);
+	partial_packet->event = packet->event;
 	partial_packet->len = full_length;
 	partial_packet->offset = packet->len;
         memcpy(partial_packet->data, packet->data, packet->len);
@@ -123,16 +128,44 @@ void reassemble_and_dispatch(BT_HDR* packet) {
 	STREAM_SKIP_UINT16(stream); //Skip the handle
 	UINT16_TO_STREAM(stream, full_length - HCI_ACL_PREAMBLE_SIZE);
 	
-	//Store in map until continue packet comes
+	//Store in map until continuation packet comes
 	partial_packets[handle] = (char*)partial_packet;
 
         //Free old packet buffer.
-	free(packet);
+	hidlCb->dealloc(packet, NULL);
     } else if (boundary_flag == CONTINUATION_PACKET_BOUNDARY){
-	
+	map<uint16_t, char*>::iterator itr =  partial_packets.find(handle);
+        if (itr == partial_packets.end()) {
+	    ALOGW("got continuation for unknown packet, Dropping it");
+	    hidlCb->dealloc(packet, NULL);
+	    return;
+	}
+        BT_HDR* partial_packet = (BT_HDR*)itr->second;
+
+	packet->offset = HCI_ACL_PREAMBLE_SIZE;
+	uint16_t projected_offset = partial_packet->offset + (packet->len - HCI_ACL_PREAMBLE_SIZE);
+	if (projected_offset > partial_packet->len) {
+	    ALOGW("continuation packet exceed expection, Truncating it");
+	    packet->len = partial_packet->len - partial_packet->offset;
+	    projected_offset = partial_packet->len;
+	}
+
+	memcpy(partial_packet->data + partial_packet->offset,
+		packet->data + packet->offset, packet->len - packet->offset);
+
+	//Free the old packet buffer, since we don't need it anymore
+	hidlCb->dealloc(packet, NULL);
+	partial_packet->offset = projected_offset;
+
+	if (partial_packet->offset == partial_packet->len) {
+	    partial_packets.erase(handle);
+	    partial_packet->offset = 0;
+	    hidlCb->acl_data_received(partial_packet);
+	}
+
     } else {
 	ALOGE("bad flag, drop this packet");
-	free(packet);
+	hidlCb->dealloc(packet, NULL);
     }
 }
 
@@ -143,16 +176,7 @@ class BluetoothHciCallbacks : public IBluetoothHciCallbacks {
 
 	BT_HDR* WrapPacketAndCopy(uint16_t event, const hidl_vec<uint8_t>& data) {
 	    int packet_size = data.size() + BT_HDR_SZ;
-	    char* p_buff = NULL;
-	    if (event == MSG_HC_TO_STACK_HCI_ACL) {
-
-		// For ACL packet, you may need to reassemble data packet, so, we use malloc()
-		// to allocate memory for it, after reassembling, you can free() it manually
-		// and then invoke hidlCb->alloc().
-		p_buff = (char*)malloc(packet_size);
-	    } else {
-		p_buff = hidlCb->alloc(packet_size);
-	    }
+	    char* p_buff = hidlCb->alloc(packet_size);
 	    if (p_buff == NULL) {
 		ALOGE("alloc memory failed");
 		return nullptr;
@@ -192,7 +216,7 @@ class BluetoothHciCallbacks : public IBluetoothHciCallbacks {
 	    BT_HDR* packet = WrapPacketAndCopy(MSG_HC_TO_STACK_HCI_ACL, data);
 	    if(packet != nullptr) {
 		reassemble_and_dispatch(packet);
-	        //hidlCb->acl_event_received(packet);
+	        //hidlCb->acl_data_received(packet);
 	    }
 	    return Void();
 	}
