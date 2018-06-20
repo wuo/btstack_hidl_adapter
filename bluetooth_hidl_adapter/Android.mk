@@ -11,6 +11,7 @@ LOCAL_SHARED_LIBRARIES := \
     liblog \
     libutils \
     libhidlbase \
+    libstdc++ \
     android.hardware.bluetooth@1.0
 
 LOCAL_C_INCLUDES += \

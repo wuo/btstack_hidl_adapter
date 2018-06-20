@@ -19,12 +19,12 @@ typedef char* (*hidl_alloc_cb)(int size);
 typedef int   (*hidl_dealloc_cb)(void* start_pointer, char* p_buf/*not used,set to NULL*/);
 
 typedef struct {
-    size_t size; //set to sizefo(bt_hidl_cb_t)
+    size_t size; //set to sizefo(bt_hidl_cb_t) 
     hidl_hci_data_cb hci_event_received; //hci event received callback
     hidl_hci_data_cb acl_data_received; //acl data received callback
     hidl_hci_data_cb sco_data_received; //sco data received callback
     hidl_hci_info_cb initialization_complete; //initialization complete callback
-    hidl_alloc_cb    alloc; //memory allocation function for new received packet
+    hidl_alloc_cb    alloc; //memory allocation function for new received packet 
     hidl_dealloc_cb  dealloc; //memory deallocation function
 } bt_hidl_cb_t;
 
