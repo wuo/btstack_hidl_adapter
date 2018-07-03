@@ -29,6 +29,7 @@ using std::map;
 #define HCI_ACL_PREAMBLE_SIZE 4
 #define L2CAP_HEADER_SIZE 4
 
+
 #define MSG_EVT_MASK 0xFF00
 
 #define MSG_HC_TO_STACK_HCI_EVT 0x1000
@@ -65,7 +66,7 @@ android::sp<IBluetoothHci> btHci;
 bt_hidl_cb_t* hidlCb;
 map<uint16_t, char*> partial_packets;
 
-//There may be memory leak in This function , check it carefully
+/**Reassemble received ACL packet*/
 void reassemble_and_dispatch(BT_HDR* packet) {
 
     uint8_t* stream = packet->data;
@@ -77,7 +78,9 @@ void reassemble_and_dispatch(BT_HDR* packet) {
 
     if (acl_length != packet->len - HCI_ACL_PREAMBLE_SIZE) {
 	ALOGE("bad acl length, drop this packet");
-	hidlCb->dealloc(packet, NULL);
+	if(hidlCb->dealloc(packet, NULL) == -1){
+	    ALOGE("%s(line %d): dealloc error", __func__, __LINE__);
+	}
 	return;
     }
 
@@ -89,13 +92,17 @@ void reassemble_and_dispatch(BT_HDR* packet) {
 	if (itr != partial_packets.end()) {
 	    ALOGW("found unfinished packet for handle with start packet, dropping old");
 	    char* old_stream = itr->second;
-	    hidlCb->dealloc(old_stream, NULL);
+	    if(hidlCb->dealloc(old_stream, NULL) == -1){
+		ALOGE("%s(line %d): dealloc error", __func__, __LINE__);
+	    }
 	    partial_packets.erase(itr);
 	}
 
         if (acl_length < L2CAP_HEADER_SIZE) {
 	    ALOGW("L2CAP packet too small, dropping it");
-	    hidlCb->dealloc(packet, NULL);
+	    if(hidlCb->dealloc(packet, NULL) == -1){
+		ALOGE("%s(line %d): dealloc error", __func__, __LINE__);
+	    }
 	    return;
 	}
 
@@ -119,6 +126,10 @@ void reassemble_and_dispatch(BT_HDR* packet) {
 	//Do need reassembling
 	//We need to reallocate memory for both start packet and the coming continuation packet
 	BT_HDR* partial_packet = (BT_HDR*)hidlCb->alloc(full_length + BT_HDR_SZ);
+	if(partial_packet == NULL) {
+	    ALOGE("%s: alloc error", __func__);
+	    return;
+	}
 	partial_packet->event = packet->event;
 	partial_packet->len = full_length;
 	partial_packet->offset = packet->len;
@@ -133,12 +144,16 @@ void reassemble_and_dispatch(BT_HDR* packet) {
 	partial_packets[handle] = (char*)partial_packet;
 
         //Free old packet buffer.
-	hidlCb->dealloc(packet, NULL);
+	if(hidlCb->dealloc(packet, NULL) == -1){
+	    ALOGE("%s(line %d): dealloc error", __func__, __LINE__);
+	}
     } else if (boundary_flag == CONTINUATION_PACKET_BOUNDARY){
 	map<uint16_t, char*>::iterator itr =  partial_packets.find(handle);
         if (itr == partial_packets.end()) {
 	    ALOGW("got continuation for unknown packet, Dropping it");
-	    hidlCb->dealloc(packet, NULL);
+	    if(hidlCb->dealloc(packet, NULL) == -1){
+		ALOGE("%s(line %d): dealloc error", __func__, __LINE__);
+	    }
 	    return;
 	}
 
@@ -158,7 +173,9 @@ void reassemble_and_dispatch(BT_HDR* packet) {
 		packet->data + packet->offset, packet->len - packet->offset);
 
 	//Free the old packet buffer, since we don't need it anymore
-	hidlCb->dealloc(packet, NULL);
+	if(hidlCb->dealloc(packet, NULL) == -1){
+	    ALOGE("%s(line %d): dealloc error", __func__, __LINE__);
+	}
 	partial_packet->offset = projected_offset;
 
 	if (partial_packet->offset == partial_packet->len) {
@@ -169,9 +186,12 @@ void reassemble_and_dispatch(BT_HDR* packet) {
 
     } else {
 	ALOGE("bad flag, drop this packet");
-	hidlCb->dealloc(packet, NULL);
+	if(hidlCb->dealloc(packet, NULL) == -1){
+	    ALOGE("%s(line %d): dealloc error", __func__, __LINE__);
+	}
     }
 }
+
 
 class BluetoothHciCallbacks : public IBluetoothHciCallbacks {
     public:
@@ -182,13 +202,12 @@ class BluetoothHciCallbacks : public IBluetoothHciCallbacks {
 	    int packet_size = data.size() + BT_HDR_SZ;
 	    char* p_buff = hidlCb->alloc(packet_size);
 	    if (p_buff == NULL) {
-		ALOGE("alloc memory failed");
+		ALOGE("%s: alloc memory failed", __func__);
 		return nullptr;
 	    }
 	    BT_HDR* packet = reinterpret_cast<BT_HDR*>(p_buff);
             packet->offset = 0;
 	    packet->len = data.size();
-	    ALOGD("size is: %d", packet->len);
 	    packet->layer_specific = 0;
 	    packet->event = event;
 
@@ -219,8 +238,10 @@ class BluetoothHciCallbacks : public IBluetoothHciCallbacks {
 	    ALOGI("aclDataReceived");
 	    BT_HDR* packet = WrapPacketAndCopy(MSG_HC_TO_STACK_HCI_ACL, data);
 	    if(packet != nullptr) {
-		reassemble_and_dispatch(packet);
+
+		//packets we received here has been fragmented, we need to reassemble it.
 	        //hidlCb->acl_data_received(packet);
+		reassemble_and_dispatch(packet);
 	    }
 	    return Void();
 	}
@@ -243,7 +264,6 @@ void hci_initialize(const bt_hidl_cb_t* cb) {
 	return;
     }
     hidlCb = (bt_hidl_cb_t*)cb;
-    
     btHci = IBluetoothHci::getService();
 
     // If android.hardware.bluetooth* is not found, Bluetooth can not continue.
@@ -251,7 +271,6 @@ void hci_initialize(const bt_hidl_cb_t* cb) {
 	ALOGE("%s: IBluetoothHci::getService() failed", __func__);
 	return;
     }
-    ALOGI("%s: IBluetoothHci::getService() returned %p (%s)", __func__, btHci.get(), (btHci->isRemote() ? "remote" : "local"));
 
     // Block allows allocation of a variable that might be bypassed by goto.
     {
@@ -276,7 +295,7 @@ void hci_transmit(BT_HDR* packet) {
 	    btHci->sendHciCommand(data);
 	    break;
 	case MSG_STACK_TO_HC_HCI_ACL:
-	    btHci->sendAclData(data);
+	    btHci->sendAclData(data);//upper layer have got max acl length already, do not need fragment
 	    break;
 	case MSG_STACK_TO_HC_HCI_SCO:
 	    btHci->sendScoData(data);
@@ -284,5 +303,9 @@ void hci_transmit(BT_HDR* packet) {
 	default:
 	    ALOGE("%s: unknown packet type to transmit", __func__);
 	    break;
+    }
+
+    if(hidlCb->dealloc((void*)packet, NULL) == -1){
+	ALOGE("%s: dealloc error", __func__);
     }
 }
